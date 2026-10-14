@@ -1,0 +1,131 @@
+
+import os
+import logging
+import tempfile
+from datetime import datetime
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import Response
+from ultralytics import YOLO
+
+app = FastAPI()
+
+UPLOAD_DIR = "uploads"
+MAX_FILE_SIZE = 5 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".jpg", ".png"}
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+logging.basicConfig(
+    filename="detection.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    encoding="utf-8"
+)
+
+model = YOLO("yolov8n.pt")
+
+
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    extension = os.path.splitext(file.filename or "")[1].lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Chi chap nhan file .jpg va .png"
+        )
+
+    contents = await file.read()
+
+    if not contents:
+        raise HTTPException(
+            status_code=400,
+            detail="File anh rong"
+        )
+
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="File khong duoc vuot qua 5MB"
+        )
+
+    image_array = np.frombuffer(contents, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="File anh khong hop le"
+        )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{timestamp}{extension}"
+    image_path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(image_path, "wb") as f:
+        f.write(contents)
+
+    try:
+        results = model(image)
+        result = results[0]
+        output_image = result.plot()
+
+        success, encoded_image = cv2.imencode(
+            ".jpg",
+            output_image
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Khong the tao anh ket qua"
+            )
+
+        detected_classes = []
+
+        for box in result.boxes:
+            class_id = int(box.cls[0].item())
+            class_name = result.names[class_id]
+            detected_classes.append(class_name)
+
+        logging.info(
+            "File: %s | Objects: %s",
+            filename,
+            ", ".join(detected_classes) if detected_classes else "None"
+        )
+
+        return Response(
+            content=encoded_image.tobytes(),
+            media_type="image/jpeg",
+            headers={
+                "X-Detected-Classes": ", ".join(
+                    sorted(set(detected_classes))
+                )
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("Detection failed for file %s", filename)
+        raise HTTPException(
+            status_code=500,
+            detail="Loi khi nhan dien hinh anh"
+        )
+
+
+@app.get("/classes")
+async def get_classes():
+    return {
+        "classes": model.names
+    }
+
+
+@app.get("/")
+async def home():
+    return {
+        "message": "YOLO Object Detection API is running"
+    }
